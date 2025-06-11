@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Streaming Chat</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 0;
+            padding: 10px;
+            background-color: #f0f0f0;
+            color: #333;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden; /* Prevent scrolling of the whole body */
+        }
+        #chat-container {
+            flex-grow: 1;
+            overflow-y: auto; /* Enable scrolling for chat content */
+            padding: 10px;
+            border: 1px solid #ccc;
+            background-color: white;
+            border-radius: 8px;
+            word-wrap: break-word; /* Ensure long words wrap */
+            white-space: pre-wrap; /* Preserve whitespace and allow wrapping */
+            margin-bottom: 10px;
+        }
+        #status-message {
+            color: gray;
+            font-style: italic;
+            margin-top: 5px;
+        }
+        #error-message {
+            color: red;
+            font-weight: bold;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div id="chat-container">
+        <div id="ai-response-display">AI is ready...</div>
+    </div>
+    <div id="status-message"></div>
+    <div id="error-message"></div>
+
+    <script>
+        // L'URL del tuo backend Vercel
+        const VERCEL_API_URL = 'https://coach-wodiet-v01.vercel.app/chat-stream';
+
+        const aiResponseDisplay = document.getElementById('ai-response-display');
+        const statusMessage = document.getElementById('status-message');
+        const errorMessage = document.getElementById('error-message');
+
+        let accumulatedResponse = '';
+        let currentUserId = '';
+        let currentSessionId = '';
+        let currentPrompt = '';
+
+        // Funzione per inviare la risposta finale a FlutterFlow
+        function sendResultToFlutterFlow(finalResponse, isError) {
+            // Questo handler deve essere registrato in FlutterFlow
+            // nel WebView Widget usando `addJavaScriptHandler`
+            if (window.flutter_inappwebview && window.flutter_inappwebview.callHandler) {
+                window.flutter_inappwebview.callHandler('onStreamComplete', {
+                    finalResponse: finalResponse,
+                    isError: isError
+                });
+            } else if (window.parent && window.parent.postMessage) {
+                // Fallback per altri tipi di WebView, se il postMessage è supportato
+                window.parent.postMessage(JSON.stringify({
+                    event: 'onStreamComplete',
+                    finalResponse: finalResponse,
+                    isError: isError
+                }), '*');
+            } else {
+                console.warn('FlutterFlow communication method not found.');
+            }
+        }
+
+        // Funzione per avviare lo streaming
+        async function startStreaming() {
+            console.log('startStreaming called.');
+            aiResponseDisplay.innerText = ''; // Pulisci la risposta precedente
+            statusMessage.innerText = 'AI is thinking...';
+            errorMessage.innerText = '';
+            accumulatedResponse = '';
+
+            if (!currentPrompt || !currentUserId || !currentSessionId) {
+                const msg = 'Error: Missing prompt, userId, or sessionId.';
+                errorMessage.innerText = msg;
+                statusMessage.innerText = '';
+                sendResultToFlutterFlow(msg, true);
+                return;
+            }
+
+            try {
+                const response = await fetch(VERCEL_API_URL, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'text/event-stream',
+                        'Cache-Control': 'no-cache',
+                        'Connection': 'keep-alive'
+                    },
+                    body: JSON.stringify({
+                        userId: currentUserId,
+                        sessionId: currentSessionId,
+                        prompt: currentPrompt
+                    })
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    const msg = `API Error: Status ${response.status} - ${errorText.substring(0, 200)}...`;
+                    errorMessage.innerText = msg;
+                    statusMessage.innerText = '';
+                    console.error(msg);
+                    sendResultToFlutterFlow(msg, true);
+                    return;
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder('utf-8');
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        console.log('Stream complete.');
+                        break;
+                    }
+                    const chunk = decoder.decode(value, { stream: true });
+                    // console.log('Received raw chunk:', chunk); // Per debug
+
+                    // Processa i chunk SSE (come nel tuo backend Node.js)
+                    const lines = chunk.split('\n');
+                    for (const line of lines) {
+                        const trimmedLine = line.trim();
+                        if (trimmedLine.startsWith('data: ')) {
+                            const jsonData = trimmedLine.substring('data: '.length).trim();
+                            if (jsonData.length > 0) {
+                                try {
+                                    const parsedJson = JSON.parse(jsonData);
+                                    if (parsedJson.content) {
+                                        accumulatedResponse += parsedJson.content;
+                                        aiResponseDisplay.innerText = accumulatedResponse; // Aggiorna la UI
+                                    } else if (parsedJson.error) {
+                                        accumulatedResponse += `\nStream Error: ${parsedJson.error}`;
+                                        errorMessage.innerText = `Stream Error: ${parsedJson.error}`;
+                                    }
+                                } catch (e) {
+                                    console.error('Error parsing JSON from chunk:', e, jsonData);
+                                    errorMessage.innerText = 'Error parsing AI response.';
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error('Fetch/streaming error:', error);
+                errorMessage.innerText = `Network or streaming error: ${error.message}`;
+                accumulatedResponse = `UNEXPECTED_ERROR: ${error.message}`;
+                sendResultToFlutterFlow(accumulatedResponse, true); // Invia errore
+                return;
+            }
+
+            // Quando lo stream è finito e non ci sono stati errori critici
+            statusMessage.innerText = 'Streaming complete.';
+            sendResultToFlutterFlow(accumulatedResponse, errorMessage.innerText.length > 0);
+        }
+
+        // --- Gestione della comunicazione da FlutterFlow a JavaScript ---
+        // Questo è il metodo principale per ricevere dati da FlutterFlow (se usi flutter_inappwebview)
+        window.addEventListener('message', (event) => {
+            // Per un WebView standard, i dati potrebbero arrivare qui
+            // Oppure FlutterFlow potrebbe usare `evaluateJavascript` direttamente
+            console.log("Message from FlutterFlow:", event.data);
+            try {
+                const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
+                if (data.type === 'startStream' && data.prompt && data.userId && data.sessionId) {
+                    currentPrompt = data.prompt;
+                    currentUserId = data.userId;
+                    currentSessionId = data.sessionId;
+                    startStreaming();
+                } else if (data.type === 'init' && data.prompt && data.userId && data.sessionId) {
+                     // Se la WebView si inizializza con i dati
+                    currentPrompt = data.prompt;
+                    currentUserId = data.userId;
+                    currentSessionId = data.sessionId;
+                    // Puoi decidere se avviare lo streaming subito o aspettare un comando 'startStream'
+                    startStreaming();
+                }
+            } catch (e) {
+                console.error("Error parsing message from FlutterFlow:", e);
+            }
+        });
+
+        // Per flutter_inappwebview, si useranno handlers specifici.
+        // FlutterFlow invierà i dati tramite evaluateJavascript
+        // E tu riceverai il risultato finale tramite addJavaScriptHandler
+        // Il codice Flutter nel Custom Widget dovrà gestire questo.
+
+        // Inizializza con un messaggio predefinito se non riceve subito dati
+        document.addEventListener('DOMContentLoaded', () => {
+            aiResponseDisplay.innerText = 'Waiting for your message...';
+            console.log('HTML loaded, waiting for FlutterFlow.');
+        });
+    </script>
+</body>
+</html>
